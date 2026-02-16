@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Playwright/local browser profile
+.pw-fb-profile/
+
+# Local secrets/session data
+cookies.json
+
+# Local environment files
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store

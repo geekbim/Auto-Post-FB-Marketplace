@@ -1,0 +1,17 @@
+{
+  "listings": [
+    {
+      "target_url": "https://www.facebook.com/marketplace/create/vehicle",
+      "selling_url": "https://www.facebook.com/marketplace/you/selling",
+      "photo_path": "sample.png",
+      "vehicle_type": "Mobil/Truk",
+      "year": "2025",
+      "make": "Toyota",
+      "model": "Avanza",
+      "price": "200000",
+      "mileage": "120000",
+      "description": "nego tipis km rendah",
+      "location": "Bekasi"
+    }
+  ]
+}
