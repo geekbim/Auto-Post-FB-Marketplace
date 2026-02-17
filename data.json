@@ -3,7 +3,7 @@
     {
       "target_url": "https://www.facebook.com/marketplace/create/vehicle",
       "selling_url": "https://www.facebook.com/marketplace/you/selling",
-      "photo_path": "sample.png",
+      "photo_paths": ["sample.png", "sample_2.png"],
       "vehicle_type": "Mobil/Truk",
       "year": "2025",
       "make": "Toyota",
@@ -11,7 +11,20 @@
       "price": "200000",
       "mileage": "120000",
       "description": "nego tipis km rendah",
-      "location": "Bekasi"
+      "location": "Bogor"
+    },
+    {
+      "target_url": "https://www.facebook.com/marketplace/create/vehicle",
+      "selling_url": "https://www.facebook.com/marketplace/you/selling",
+      "photo_paths": ["sample.png", "sample_2.png"],
+      "vehicle_type": "Mobil/Truk",
+      "year": "2025",
+      "make": "Toyota",
+      "model": "Yaris",
+      "price": "200000",
+      "mileage": "120000",
+      "description": "nego tipis km rendah",
+      "location": "Jakarta"
     }
   ]
 }

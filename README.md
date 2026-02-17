@@ -44,7 +44,7 @@ python fb_marketplace_vehicle_dom_update.py --data-file data.json --cookies-file
     {
       "target_url": "https://www.facebook.com/marketplace/create/vehicle",
       "selling_url": "https://www.facebook.com/marketplace/you/selling",
-      "photo_path": "sample.png",
+      "photo_paths": ["sample.png", "sample_2.png"],
       "vehicle_type": "Mobil/Truk",
       "year": "2025",
       "make": "Toyota",
@@ -59,5 +59,7 @@ python fb_marketplace_vehicle_dom_update.py --data-file data.json --cookies-file
 ```
 
 Notes:
-- If a `photo_path` is missing or invalid, the script falls back to the first image found in project root.
+- Use `photo_paths` for multiple images.
+- `photo_path` still works for single image (backward compatible), including comma-separated values.
+- If configured image paths are missing/invalid, the script falls back to images found in project root.
 - If `data.json` is missing/empty, the script falls back to one default listing run.

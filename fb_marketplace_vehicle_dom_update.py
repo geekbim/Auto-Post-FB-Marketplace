@@ -123,6 +123,12 @@ def parse_args() -> argparse.Namespace:
         default=COOKIE_FILE_DEFAULT,
         help="JSON file with Facebook cookies (default: cookies.json)",
     )
+    parser.add_argument(
+        "--post-location-delay-sec",
+        type=float,
+        default=2.0,
+        help="Delay in seconds after location is committed before clicking 'Simpan draf' (default: 2.0)",
+    )
     return parser.parse_args()
 
 
@@ -181,42 +187,126 @@ def load_raw_cookies(cookies_file: Path) -> list[dict]:
     return []
 
 
-def discover_project_photo(project_root: Path) -> Path | None:
+def discover_project_photos(project_root: Path) -> list[Path]:
+    photos: list[Path] = []
+    seen: set[Path] = set()
     for pattern in PHOTO_GLOB_PATTERNS:
-        matches = sorted(project_root.glob(pattern))
-        if matches:
-            return matches[0]
-    return None
+        for match in sorted(project_root.glob(pattern)):
+            resolved = match.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            photos.append(resolved)
+    return photos
 
 
-def resolve_photo_path(project_root: Path, photo_path_arg: str) -> Path | None:
+def _resolve_single_photo(project_root: Path, raw_path: str) -> Path | None:
+    if not raw_path.strip():
+        return None
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (project_root / candidate).resolve()
+    return candidate if candidate.exists() else None
+
+
+def resolve_photo_paths(
+    project_root: Path, photo_path_arg: str = "", photo_paths_arg: list[str] | None = None
+) -> list[Path]:
+    requested: list[str] = []
+    if photo_paths_arg:
+        requested.extend([str(p).strip() for p in photo_paths_arg if str(p).strip()])
     if photo_path_arg.strip():
-        candidate = Path(photo_path_arg).expanduser()
-        if not candidate.is_absolute():
-            candidate = (project_root / candidate).resolve()
-        if candidate.exists():
-            return candidate
-        # Fallback when configured photo path is stale/renamed.
-        return discover_project_photo(project_root)
-    return discover_project_photo(project_root)
+        # Support comma-separated paths in single field.
+        requested.extend([part.strip() for part in photo_path_arg.split(",") if part.strip()])
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    missing: list[str] = []
+    for raw_path in requested:
+        candidate = _resolve_single_photo(project_root, raw_path)
+        if candidate:
+            if candidate not in seen:
+                seen.add(candidate)
+                resolved.append(candidate)
+            continue
+        missing.append(raw_path)
+
+    if missing:
+        print(f"[WARN] photo path not found: {', '.join(missing)}")
+
+    if resolved:
+        return resolved
+    # Fallback when configured photo path is missing/stale.
+    return discover_project_photos(project_root)
 
 
-def upload_photo(page, photo_path: Path) -> bool:
+def upload_photo(page, photo_paths: list[Path]) -> bool:
     try:
+        files = [str(p) for p in photo_paths if p.exists()]
+        if not files:
+            return False
+
+        remove_photo_locator = page.locator('[aria-label="Hapus foto dari tawaran"]')
+        target_count = len(files)
+
+        def current_count() -> int:
+            try:
+                return remove_photo_locator.count()
+            except Exception:
+                return 0
+
+        def wait_count_at_least(expected: int, timeout_ms: int = 12000) -> bool:
+            deadline = time.time() + (timeout_ms / 1000)
+            while time.time() < deadline:
+                if current_count() >= expected:
+                    return True
+                page.wait_for_timeout(250)
+            return current_count() >= expected
+
+        if current_count() >= target_count:
+            print(f"[OK] Photos already uploaded: {current_count()}")
+            return True
+
+        # First try: upload all files in one shot (works when input supports multiple files).
         file_input = page.locator('input[type="file"][accept*="image"]').first
         if file_input.count() > 0:
-            file_input.set_input_files(str(photo_path))
-        else:
-            add_btn = page.get_by_role("button", name=re.compile("Tambahkan Foto|Tambahkan foto", re.I)).first
-            if add_btn.count() == 0:
-                return False
-            with page.expect_file_chooser(timeout=4000) as chooser_info:
-                add_btn.click()
-            chooser_info.value.set_files(str(photo_path))
+            try:
+                file_input.set_input_files(files)
+                if wait_count_at_least(target_count):
+                    print(f"[OK] Photos uploaded: {target_count}")
+                    return True
+            except Exception:
+                pass
 
-        page.locator('[aria-label="Hapus foto dari tawaran"]').first.wait_for(timeout=12000)
-        print(f"[OK] Photo uploaded: {photo_path}")
-        return True
+        # Fallback: append files one-by-one via the "Tambahkan Foto" chooser flow.
+        add_btn = page.get_by_role("button", name=re.compile("Tambahkan Foto|Tambahkan foto", re.I)).first
+        for file_path in files:
+            before = current_count()
+            if before >= target_count:
+                break
+            try:
+                if add_btn.count() > 0:
+                    with page.expect_file_chooser(timeout=5000) as chooser_info:
+                        add_btn.click()
+                    chooser_info.value.set_files(file_path)
+                elif file_input.count() > 0:
+                    file_input.set_input_files(file_path)
+                else:
+                    return False
+
+                if not wait_count_at_least(before + 1, timeout_ms=8000):
+                    # If count doesn't increase, try next; final check below decides success.
+                    continue
+            except Exception:
+                continue
+
+        final_count = current_count()
+        if final_count >= target_count:
+            print(f"[OK] Photos uploaded: {final_count}")
+            return True
+
+        print(f"[WARN] photos uploaded partially: expected={target_count} actual={final_count}")
+        return False
     except Exception as exc:
         print(f"[WARN] photo upload retry: {exc}")
         return False
@@ -643,6 +733,148 @@ def enforce_labeled_text_input_commit(
             continue
 
     return not required
+
+
+def enforce_location_commit(page, label_text: str, location_value: str) -> bool:
+    containers = page.locator("div.xjbqb8w.x1iyjqo2.x193iq5w.xeuugli.x1n2onr6").filter(
+        has_text=re.compile(re.escape(label_text), re.I)
+    )
+    visible_containers = containers.locator(":scope:visible") if containers.count() > 0 else containers
+    active_containers = visible_containers if visible_containers.count() > 0 else containers
+
+    required = False
+    for i in range(active_containers.count()):
+        container = active_containers.nth(i)
+        # Prefer input directly associated with the "Lokasi" label in the same block.
+        location_input = container.locator(
+            "xpath=.//span[normalize-space()='Lokasi']/following::input[@role='combobox'][1]"
+        ).first
+        if location_input.count() == 0:
+            location_input = container.locator('input[role="combobox"][aria-label*="Lokasi"]:visible').first
+        if location_input.count() == 0:
+            location_input = container.locator('input[role="combobox"]:visible').first
+        if location_input.count() == 0:
+            location_input = container.locator('input[type="text"]:visible').first
+        if location_input.count() == 0:
+            continue
+
+        required = True
+        try:
+            for _ in range(3):
+                selected = False
+                location_input.scroll_into_view_if_needed(timeout=1200)
+                location_input.click(timeout=1200)
+                location_input.press("ControlOrMeta+a", timeout=800)
+                location_input.type(location_value, delay=25, timeout=2500)
+                page.wait_for_timeout(350)
+
+                # Prefer explicit option pick when available.
+                option_patterns = [
+                    page.get_by_role("option", name=re.compile(rf"^\s*{re.escape(location_value)}\s*$", re.I)).first,
+                    page.get_by_role("option", name=re.compile(re.escape(location_value), re.I)).first,
+                    page.locator('[role="listbox"] [role="option"]:visible').filter(
+                        has_text=re.compile(re.escape(location_value), re.I)
+                    ).first,
+                    page.locator('[role="listbox"] span:visible').filter(
+                        has_text=re.compile(re.escape(location_value), re.I)
+                    ).first,
+                ]
+                for option in option_patterns:
+                    if option.count() == 0:
+                        continue
+                    try:
+                        option.click(timeout=1600)
+                        selected = True
+                        break
+                    except Exception:
+                        continue
+
+                if not selected:
+                    try:
+                        location_input.press("ArrowDown", timeout=800)
+                        location_input.press("Enter", timeout=1200)
+                    except Exception:
+                        try:
+                            location_input.press("Enter", timeout=1200)
+                        except Exception:
+                            pass
+
+                try:
+                    location_input.press("Tab", timeout=1000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(450)
+
+                current = (location_input.input_value() or "").strip()
+                valid_state = False
+                try:
+                    valid_state = bool(
+                        page.evaluate(
+                            """
+                            (el) => {
+                              if (!el) return false;
+                              const ref = el.getAttribute('aria-describedby');
+                              if (!ref) return false;
+                              const validNode = document.getElementById(ref);
+                              if (!validNode) return false;
+                              const aria = (validNode.getAttribute('aria-label') || '').toLowerCase();
+                              return aria.includes('valid');
+                            }
+                            """,
+                            location_input.element_handle(),
+                        )
+                    )
+                except Exception:
+                    valid_state = False
+
+                target_norm = re.sub(r"\s+", " ", location_value).strip().lower()
+                current_norm = re.sub(r"\s+", " ", current).strip().lower()
+                current_ok = target_norm in current_norm
+                strict_text_ok = current_norm == target_norm
+                # Require validated state, or strict exact match after explicit option click.
+                if current_ok and (valid_state or (selected and strict_text_ok)):
+                    return True
+        except Exception:
+            continue
+
+    # Fallback: use global combobox by aria-label when container variants change.
+    try:
+        combo = page.get_by_role("combobox", name=re.compile("Lokasi", re.I)).first
+        if combo.count() > 0:
+            required = True
+            combo.click(timeout=1200)
+            combo.press("ControlOrMeta+a", timeout=800)
+            combo.type(location_value, delay=25, timeout=2500)
+            page.wait_for_timeout(350)
+
+            opt = page.get_by_role("option", name=re.compile(re.escape(location_value), re.I)).first
+            selected = False
+            if opt.count() > 0:
+                try:
+                    opt.click(timeout=1500)
+                    selected = True
+                except Exception:
+                    pass
+            if not selected:
+                try:
+                    combo.press("ArrowDown", timeout=800)
+                    combo.press("Enter", timeout=1200)
+                except Exception:
+                    pass
+
+            try:
+                combo.press("Tab", timeout=1000)
+            except Exception:
+                pass
+            page.wait_for_timeout(450)
+            current = (combo.input_value() or "").strip()
+            if re.sub(r"\s+", " ", location_value).strip().lower() in re.sub(r"\s+", " ", current).strip().lower():
+                return True
+    except Exception:
+        pass
+
+    # Strict: location must be explicitly committed; do not allow soft pass.
+    return False
 
 
 def wait_and_find_berikutnya(page, timeout_ms: int = 4000) -> dict:
@@ -1351,18 +1583,56 @@ def patch_dom(page, attr_name: str, attr_value: str) -> bool:
 
       const locationContainers = Array.from(document.querySelectorAll('div.xjbqb8w.x1iyjqo2.x193iq5w.xeuugli.x1n2onr6'));
       for (const container of locationContainers) {
-        const label = container.querySelector('span');
-        if (!label) continue;
-        if ((label.textContent || '').trim() !== locationLabel) continue;
+        const labels = Array.from(container.querySelectorAll('span'));
+        if (!labels.some((label) => (label.textContent || '').trim() === locationLabel)) continue;
 
-        const input = container.querySelector('input[role="combobox"][aria-label="Lokasi"]');
+        const input =
+          container.querySelector('span#_r_91_')?.parentElement?.querySelector('input[role="combobox"]') ||
+          container.querySelector('input[role="combobox"][aria-label="Lokasi"]') ||
+          container.querySelector('input[role="combobox"][aria-label*="Lokasi"]') ||
+          container.querySelector('input[role="combobox"]') ||
+          container.querySelector('input[type="text"]');
         if (!input) continue;
 
-        const locationValueOk = setControlValue(input, locationText);
-        input.setAttribute('aria-describedby', '_r_2h_');
+        const locationValueOk = setControlValue(
+          input,
+          locationText,
+          (actual, expected) => normalize(actual).toLowerCase() === normalize(expected).toLowerCase(),
+        );
         input.setAttribute('tabindex', '0');
 
-        locationPatched = locationValueOk;
+        let describedBy = input.getAttribute('aria-describedby') || '';
+        let validNode = describedBy ? document.getElementById(describedBy) : null;
+        if (!validNode) {
+          const validId = `_r_loc_${Math.random().toString(36).slice(2, 8)}_`;
+          const rightSlot = document.createElement('div');
+          rightSlot.className = 'x78zum5';
+          const iconWrap = document.createElement('div');
+          iconWrap.className = 'xv54qhq x109j2v6';
+          const icon = document.createElement('i');
+          icon.className = 'x1b0d499 x1hq76kk';
+          icon.id = validId;
+          icon.setAttribute('aria-label', 'Input Lokasi valid.');
+          icon.setAttribute('role', 'img');
+          icon.style.cssText = 'background-image: url("https://static.xx.fbcdn.net/rsrc.php/v4/yD/r/9zyXlTTJLT-.png"); background-position: 0px -363px; background-size: 33px 996px; width: 20px; height: 20px; background-repeat: no-repeat; display: inline-block;';
+          iconWrap.appendChild(icon);
+          rightSlot.appendChild(iconWrap);
+
+          const labelRoot = container.closest('label') || container.parentElement;
+          if (labelRoot && !labelRoot.querySelector(`#${validId}`)) {
+            labelRoot.appendChild(rightSlot);
+            validNode = icon;
+            describedBy = validId;
+          }
+        }
+        if (validNode) {
+          describedBy = validNode.id || describedBy;
+          input.setAttribute('aria-describedby', describedBy);
+        }
+
+        const ariaOk = !!(input.getAttribute('aria-describedby') || '').trim();
+        const tabOk = input.getAttribute('tabindex') === '0';
+        locationPatched = locationValueOk && ariaOk && tabOk;
         locationOuterHTML = container.outerHTML;
         break;
       }
@@ -1381,7 +1651,7 @@ def patch_dom(page, attr_name: str, attr_value: str) -> bool:
       const legacyYearOk = yearPatchedCount >= 1 || yearFieldGroupOk;
 
       return {
-        ok: legacyVehicleOk && legacyYearOk && vehicleTypeGroupOk && yearFieldGroupOk && toyotaGroupOk && modelGroupOk && priceGroupOk && mileageGroupOk && descriptionGroupOk && locationPatched,
+        ok: legacyVehicleOk && legacyYearOk && vehicleTypeGroupOk && yearFieldGroupOk && toyotaGroupOk && modelGroupOk && priceGroupOk && mileageGroupOk && descriptionGroupOk,
         pageReady: true,
         vehiclePatched,
         yearPatched,
@@ -1556,7 +1826,7 @@ def patch_dom(page, attr_name: str, attr_value: str) -> bool:
 class ListingConfig:
     target_url: str
     selling_url: str
-    photo_path: Path
+    photo_paths: list[Path]
     vehicle_type: str
     year: str
     make: str
@@ -1592,14 +1862,25 @@ def build_listing_config(
     location = _pick_listing_value(listing, ("location", "lokasi"), LOCATION_TEXT)
     target_url = _pick_listing_value(listing, ("target_url",), default_target_url)
     selling_url = _pick_listing_value(listing, ("selling_url",), default_selling_url)
+    photo_paths_raw = listing.get("photo_paths")
+    listing_photo_paths: list[str] = []
+    if isinstance(photo_paths_raw, list):
+        listing_photo_paths = [str(v).strip() for v in photo_paths_raw if str(v).strip()]
+    elif isinstance(photo_paths_raw, str) and photo_paths_raw.strip():
+        listing_photo_paths = [part.strip() for part in photo_paths_raw.split(",") if part.strip()]
+
     listing_photo_arg = _pick_listing_value(listing, ("photo_path",), args.photo_path)
-    photo_path = resolve_photo_path(project_root, listing_photo_arg)
-    if not photo_path:
+    photo_paths = resolve_photo_paths(
+        project_root,
+        photo_path_arg=listing_photo_arg,
+        photo_paths_arg=listing_photo_paths,
+    )
+    if not photo_paths:
         return None
     return ListingConfig(
         target_url=target_url,
         selling_url=selling_url,
-        photo_path=photo_path,
+        photo_paths=photo_paths,
         vehicle_type=vehicle_type,
         year=year,
         make=make,
@@ -1659,13 +1940,15 @@ def run_single_listing(page, config: ListingConfig, args: argparse.Namespace) ->
     selects_ok = False
     model_commit_ok = False
     mileage_commit_ok = False
+    location_commit_ok = False
+    location_commit_ts: float | None = None
 
     while time.time() < deadline:
         try:
             attempts += 1
             page.wait_for_timeout(1500)
             if not photo_success:
-                photo_success = upload_photo(page, config.photo_path)
+                photo_success = upload_photo(page, config.photo_paths)
             if "/marketplace/create/vehicle" not in page.url:
                 page.goto(config.target_url, wait_until="domcontentloaded")
                 page.wait_for_timeout(800)
@@ -1690,7 +1973,15 @@ def run_single_listing(page, config: ListingConfig, args: argparse.Namespace) ->
                 mileage_commit_ok = enforce_labeled_text_input_commit(
                     page, MILEAGE_LABEL, config.mileage, digits_only=True
                 )
-            if dom_stable_count >= 2 and photo_success and selects_ok and model_commit_ok and mileage_commit_ok and not draft_clicked:
+                location_commit_ok = enforce_location_commit(page, LOCATION_LABEL, config.location)
+                if location_commit_ok and location_commit_ts is None:
+                    location_commit_ts = time.time()
+
+            delay_ok = True
+            if location_commit_ts is not None:
+                delay_ok = (time.time() - location_commit_ts) >= max(0.0, args.post_location_delay_sec)
+
+            if dom_stable_count >= 2 and photo_success and selects_ok and model_commit_ok and mileage_commit_ok and location_commit_ok and delay_ok and not draft_clicked:
                 draft_clicked = click_save_draft(page)
             if draft_clicked and not leave_clicked:
                 leave_clicked = click_tinggalkan_halaman(page)
@@ -1700,6 +1991,7 @@ def run_single_listing(page, config: ListingConfig, args: argparse.Namespace) ->
                 and selects_ok
                 and model_commit_ok
                 and mileage_commit_ok
+                and location_commit_ok
                 and draft_clicked
                 and leave_clicked
             )
@@ -1718,6 +2010,7 @@ def run_single_listing(page, config: ListingConfig, args: argparse.Namespace) ->
             f"selects_ok={selects_ok}",
             f"model_commit_ok={model_commit_ok}",
             f"mileage_commit_ok={mileage_commit_ok}",
+            f"location_commit_ok={location_commit_ok}",
             f"draft_clicked={draft_clicked}",
             f"leave_clicked={leave_clicked}",
         )
@@ -1762,7 +2055,7 @@ def main() -> int:
                 default_selling_url=default_selling_url,
             )
             if not config:
-                print(f"[ERROR] listing#{idx} no image found. Provide photo_path in data file or --photo-path.")
+                print(f"[ERROR] listing#{idx} no image found. Provide photo_paths/photo_path in data file or --photo-path.")
                 failed_count += 1
                 continue
 
